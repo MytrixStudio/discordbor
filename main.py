@@ -21,8 +21,11 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
-BOT_VERSION = "2.0.0"
+BOT_VERSION = "2.1.0"
 PANEL_TITLE = "🔐 Registro de nicknames"
+TICKET_PANEL_TITLE = "🎫 Soporte"
+TICKET_TOPIC_PREFIX = "mystrix-ticket-owner:"
+DEFAULT_AUTO_ROLE_ID = 1529563371098083510
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{3,16}$")
 ALLOWED_ACTIONS = {"ADD", "EDIT", "UNLINK", "LOOKUP"}
 LOGGER = logging.getLogger("mystrix-render-bridge")
@@ -103,6 +106,9 @@ class Config:
     guild_id: int
     panel_channel_id: int
     admin_role_id: int
+    ticket_support_role_id: int
+    auto_role_id: int | None
+    ticket_category_id: int | None
     bridge_secret: str
     bridge_server_id: str
     web_host: str
@@ -117,12 +123,23 @@ class Config:
     def load(cls) -> "Config":
         load_environment_files()
 
-        def snowflake(name: str, *aliases: str) -> int:
-            value = get_env(name, *aliases)
+        def parse_snowflake(value: str, label: str) -> int:
             if not value.isdigit() or int(value) <= 0:
-                choices = ", ".join((name, *aliases))
-                raise RuntimeError(f"{choices} debe ser un ID numérico válido.")
+                raise RuntimeError(f"{label} debe ser un ID numérico válido.")
             return int(value)
+
+        def snowflake(name: str, *aliases: str) -> int:
+            return parse_snowflake(get_env(name, *aliases), ", ".join((name, *aliases)))
+
+        def optional_snowflake(
+            name: str,
+            *aliases: str,
+            default: int | None = None,
+        ) -> int | None:
+            value = get_env(name, *aliases, required=False)
+            if not value:
+                return default
+            return parse_snowflake(value, ", ".join((name, *aliases)))
 
         try:
             web_port = int(os.getenv("PORT", os.getenv("WEB_PORT", "8080")))
@@ -160,6 +177,25 @@ class Config:
                 "DISCORD_ADMIN_ROLE_ID",
                 "DISCORD_REQUIRED_ROLE_ID",
                 "ADMIN_ROLE_ID",
+            ),
+            ticket_support_role_id=optional_snowflake(
+                "DISCORD_TICKET_SUPPORT_ROLE_ID",
+                "TICKET_SUPPORT_ROLE_ID",
+                default=snowflake(
+                    "DISCORD_ADMIN_ROLE_ID",
+                    "DISCORD_REQUIRED_ROLE_ID",
+                    "ADMIN_ROLE_ID",
+                ),
+            )
+            or 0,
+            auto_role_id=optional_snowflake(
+                "DISCORD_AUTO_ROLE_ID",
+                "AUTO_ROLE_ID",
+                default=DEFAULT_AUTO_ROLE_ID,
+            ),
+            ticket_category_id=optional_snowflake(
+                "DISCORD_TICKET_CATEGORY_ID",
+                "TICKET_CATEGORY_ID",
             ),
             bridge_secret=normalize_bridge_secret(
                 get_env(
@@ -424,6 +460,107 @@ def build_panel_embed(bot_user: discord.ClientUser | None) -> discord.Embed:
     return embed
 
 
+def build_ticket_panel_embed(bot_user: discord.ClientUser | None) -> discord.Embed:
+    embed = discord.Embed(
+        title=TICKET_PANEL_TITLE,
+        description=(
+            "**¿Necesitas ayuda?** Presiona el botón de abajo para abrir un ticket.\n\n"
+            "Se creará un canal privado donde solo podrás escribir tú y el equipo "
+            "de soporte. Explica tu problema con calma y adjunta pruebas si hacen falta."
+        ),
+        colour=discord.Colour.from_rgb(88, 101, 242),
+    )
+    embed.add_field(
+        name="Privacidad",
+        value="El ticket no será visible para el resto del servidor.",
+        inline=False,
+    )
+    embed.add_field(
+        name="Soporte",
+        value="Un miembro del equipo responderá dentro del canal creado.",
+        inline=False,
+    )
+    if bot_user:
+        embed.set_footer(
+            text=bot_user.display_name,
+            icon_url=bot_user.display_avatar.url,
+        )
+    else:
+        embed.set_footer(text="MystrixBot")
+    return embed
+
+
+def build_ticket_opened_embed(
+    member: discord.Member,
+    support_role: discord.Role,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title="Ticket de soporte abierto",
+        description=(
+            "Escribe aquí qué necesitas. Este canal solo lo pueden ver tú y el "
+            "equipo de soporte."
+        ),
+        colour=discord.Colour.from_rgb(87, 242, 135),
+    )
+    embed.add_field(name="Usuario", value=member.mention, inline=True)
+    embed.add_field(name="Soporte", value=support_role.mention, inline=True)
+    embed.set_footer(text="Usa el botón de cerrar cuando el caso esté resuelto.")
+    return embed
+
+
+def ticket_channel_name(member: discord.Member) -> str:
+    cleaned = re.sub(r"[^a-z0-9-]+", "-", member.name.lower()).strip("-")
+    if not cleaned:
+        cleaned = "usuario"
+    return f"ticket-{cleaned}-{str(member.id)[-4:]}"[:90]
+
+
+def ticket_topic(member: discord.Member) -> str:
+    return f"{TICKET_TOPIC_PREFIX}{member.id}"
+
+
+def ticket_owner_id(channel: discord.TextChannel) -> int | None:
+    topic = channel.topic or ""
+    pattern = rf"{re.escape(TICKET_TOPIC_PREFIX)}([0-9]+)"
+    match = re.search(pattern, topic)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def find_open_ticket_channel(
+    guild: discord.Guild,
+    member_id: int,
+) -> discord.TextChannel | None:
+    marker = f"{TICKET_TOPIC_PREFIX}{member_id}"
+    for channel in guild.text_channels:
+        if channel.topic and marker in channel.topic:
+            return channel
+    return None
+
+
+async def resolve_ticket_category(
+    interaction: discord.Interaction,
+    config: Config,
+) -> discord.CategoryChannel | None:
+    guild = interaction.guild
+    if guild is None:
+        return None
+
+    if config.ticket_category_id:
+        channel = guild.get_channel(config.ticket_category_id)
+        if channel is None:
+            try:
+                channel = await guild.fetch_channel(config.ticket_category_id)
+            except discord.DiscordException:
+                return None
+        return channel if isinstance(channel, discord.CategoryChannel) else None
+
+    if isinstance(interaction.channel, discord.TextChannel):
+        return interaction.channel.category
+    return None
+
+
 def is_configured_guild(
     interaction: discord.Interaction,
     config: Config,
@@ -439,6 +576,16 @@ def is_admin(interaction: discord.Interaction, config: Config) -> bool:
     return isinstance(member, discord.Member) and (
         member.guild_permissions.administrator
         or any(role.id == config.admin_role_id for role in member.roles)
+    )
+
+
+def is_ticket_staff(member: discord.Member, config: Config) -> bool:
+    return (
+        member.guild_permissions.administrator
+        or any(
+            role.id in {config.admin_role_id, config.ticket_support_role_id}
+            for role in member.roles
+        )
     )
 
 
@@ -660,10 +807,201 @@ class WhitelistPanelView(discord.ui.View):
         await safe_error(interaction, "❌ Ocurrió un error interno.")
 
 
+class TicketCloseView(discord.ui.View):
+    def __init__(self, *, config: Config) -> None:
+        super().__init__(timeout=None)
+        self.config = config
+
+    @discord.ui.button(
+        label="Cerrar ticket",
+        emoji="🔒",
+        style=discord.ButtonStyle.danger,
+        custom_id="mystrix:ticket:close:v1",
+    )
+    async def close_ticket(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if (
+            interaction.guild_id != self.config.guild_id
+            or not isinstance(interaction.user, discord.Member)
+            or not isinstance(interaction.channel, discord.TextChannel)
+        ):
+            await interaction.response.send_message(
+                "❌ Este botón solo funciona dentro de un ticket.",
+                ephemeral=True,
+            )
+            return
+
+        owner_id = ticket_owner_id(interaction.channel)
+        if owner_id is None:
+            await interaction.response.send_message(
+                "❌ Este canal no parece ser un ticket gestionado por el bot.",
+                ephemeral=True,
+            )
+            return
+
+        if interaction.user.id != owner_id and not is_ticket_staff(
+            interaction.user,
+            self.config,
+        ):
+            await interaction.response.send_message(
+                "❌ Solo el creador del ticket o soporte pueden cerrarlo.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            "🔒 Ticket cerrado. El canal se eliminará en 5 segundos."
+        )
+        await asyncio.sleep(5)
+        try:
+            await interaction.channel.delete(
+                reason=f"Ticket cerrado por {interaction.user} ({interaction.user.id})"
+            )
+        except discord.DiscordException:
+            LOGGER.exception(
+                "No se pudo eliminar ticket channel_id=%s",
+                interaction.channel.id,
+            )
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self, *, config: Config) -> None:
+        super().__init__(timeout=None)
+        self.config = config
+
+    @discord.ui.button(
+        label="Abrir ticket",
+        emoji="🎫",
+        style=discord.ButtonStyle.primary,
+        custom_id="mystrix:ticket:open:v1",
+    )
+    async def open_ticket(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if not is_configured_guild(interaction, self.config):
+            await interaction.response.send_message(
+                "❌ Este panel solo funciona dentro del servidor configurado.",
+                ephemeral=True,
+            )
+            return
+
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            await interaction.response.send_message(
+                "❌ No pude identificar el servidor o el usuario.",
+                ephemeral=True,
+            )
+            return
+
+        existing = find_open_ticket_channel(guild, member.id)
+        if existing is not None:
+            await interaction.response.send_message(
+                f"Ya tienes un ticket abierto: {existing.mention}",
+                ephemeral=True,
+            )
+            return
+
+        support_role = guild.get_role(self.config.ticket_support_role_id)
+        if support_role is None:
+            await interaction.response.send_message(
+                "❌ No encontré el rol de soporte configurado.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        category = await resolve_ticket_category(interaction, self.config)
+        me = guild.me
+        admin_role = guild.get_role(self.config.admin_role_id)
+
+        overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            member: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+                embed_links=True,
+            ),
+            support_role: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+                embed_links=True,
+            ),
+        }
+        if admin_role is not None and admin_role.id != support_role.id:
+            overwrites[admin_role] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+                embed_links=True,
+            )
+        if me is not None:
+            overwrites[me] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                manage_channels=True,
+                manage_messages=True,
+            )
+
+        try:
+            channel = await guild.create_text_channel(
+                name=ticket_channel_name(member),
+                category=category,
+                overwrites=overwrites,
+                topic=ticket_topic(member),
+                reason=f"Ticket abierto por {member} ({member.id})",
+            )
+            await channel.send(
+                content=f"{member.mention} {support_role.mention}",
+                embed=build_ticket_opened_embed(member, support_role),
+                view=TicketCloseView(config=self.config),
+                allowed_mentions=discord.AllowedMentions(users=True, roles=True),
+            )
+        except discord.Forbidden:
+            await interaction.edit_original_response(
+                content=(
+                    "❌ No tengo permisos para crear canales privados. Necesito "
+                    "`Manage Channels` y acceso al rol/categoría."
+                )
+            )
+            return
+        except discord.DiscordException:
+            LOGGER.exception("No se pudo crear ticket para user_id=%s", member.id)
+            await interaction.edit_original_response(
+                content="❌ No pude crear el ticket. Revisa permisos del bot."
+            )
+            return
+
+        await interaction.edit_original_response(
+            content=f"✅ Ticket creado correctamente: {channel.mention}"
+        )
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item[Any],
+    ) -> None:
+        LOGGER.exception("Error en panel de tickets", exc_info=error)
+        await safe_error(interaction, "❌ Ocurrió un error interno.")
+
+
 class MystrixBot(commands.Bot):
     def __init__(self, config: Config, broker: OperationBroker) -> None:
         intents = discord.Intents.none()
         intents.guilds = True
+        intents.members = True
         super().__init__(
             command_prefix=commands.when_mentioned,
             intents=intents,
@@ -674,9 +1012,9 @@ class MystrixBot(commands.Bot):
         self.guild_object = discord.Object(id=config.guild_id)
 
     async def setup_hook(self) -> None:
-        self.add_view(
-            WhitelistPanelView(broker=self.broker, config=self.config)
-        )
+        self.add_view(WhitelistPanelView(broker=self.broker, config=self.config))
+        self.add_view(TicketPanelView(config=self.config))
+        self.add_view(TicketCloseView(config=self.config))
         register_commands(self)
         await self.tree.sync(guild=self.guild_object)
         LOGGER.info("Comandos sincronizados en guild_id=%s", self.config.guild_id)
@@ -684,6 +1022,38 @@ class MystrixBot(commands.Bot):
     async def on_ready(self) -> None:
         if self.user:
             LOGGER.info("Bot conectado como %s (%s)", self.user, self.user.id)
+
+    async def on_member_join(self, member: discord.Member) -> None:
+        if member.guild.id != self.config.guild_id or self.config.auto_role_id is None:
+            return
+
+        role = member.guild.get_role(self.config.auto_role_id)
+        if role is None:
+            LOGGER.error("No encontré el rol automático id=%s", self.config.auto_role_id)
+            return
+        if role in member.roles:
+            return
+
+        try:
+            await member.add_roles(role, reason="Rol automático al entrar al servidor")
+            LOGGER.info(
+                "Rol automático asignado role_id=%s user_id=%s",
+                role.id,
+                member.id,
+            )
+        except discord.Forbidden:
+            LOGGER.error(
+                "No pude asignar el rol automático role_id=%s user_id=%s. "
+                "Revisa Manage Roles y la jerarquía del rol del bot.",
+                role.id,
+                member.id,
+            )
+        except discord.DiscordException:
+            LOGGER.exception(
+                "Error asignando rol automático role_id=%s user_id=%s",
+                role.id,
+                member.id,
+            )
 
 
 def register_commands(bot: MystrixBot) -> None:
@@ -743,6 +1113,66 @@ def register_commands(bot: MystrixBot) -> None:
             await channel.send(embed=build_panel_embed(bot.user), view=view)
             await interaction.edit_original_response(
                 content=f"✅ Panel publicado en {channel.mention}."
+            )
+
+    @bot.tree.command(
+        name="ticket-panel",
+        description="Publica o actualiza el panel de soporte.",
+        guild=guild,
+    )
+    @app_commands.describe(canal="Canal donde se publicará el panel")
+    async def ticket_panel(
+        interaction: discord.Interaction,
+        canal: discord.TextChannel | None = None,
+    ) -> None:
+        if not is_admin(interaction, bot.config):
+            await interaction.response.send_message(
+                "❌ No tienes permiso para publicar el panel de soporte.",
+                ephemeral=True,
+            )
+            return
+
+        target = canal or interaction.channel
+        if not isinstance(target, discord.TextChannel):
+            await interaction.response.send_message(
+                "❌ El panel solo se puede publicar en un canal de texto.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        view = TicketPanelView(config=bot.config)
+        existing: discord.Message | None = None
+        try:
+            async for message in target.history(limit=100):
+                if (
+                    bot.user
+                    and message.author.id == bot.user.id
+                    and message.embeds
+                    and message.embeds[0].title == TICKET_PANEL_TITLE
+                ):
+                    existing = message
+                    break
+        except discord.DiscordException:
+            existing = None
+
+        try:
+            if existing:
+                await existing.edit(embed=build_ticket_panel_embed(bot.user), view=view)
+                await interaction.edit_original_response(
+                    content="✅ El panel de soporte existente fue actualizado."
+                )
+            else:
+                await target.send(embed=build_ticket_panel_embed(bot.user), view=view)
+                await interaction.edit_original_response(
+                    content=f"✅ Panel de soporte publicado en {target.mention}."
+                )
+        except discord.Forbidden:
+            await interaction.edit_original_response(
+                content=(
+                    "❌ No tengo permisos para publicar en ese canal. Necesito "
+                    "`Send Messages`, `Embed Links` y `Read Message History`."
+                )
             )
 
     @bot.tree.command(
@@ -941,6 +1371,11 @@ async def run_application() -> None:
                 "Discord rechazó DISCORD_TOKEN. En Render configura el token real "
                 "del bot desde Discord Developer Portal; no uses la URL de invitación, "
                 "client secret ni el public key."
+            ) from exc
+        except discord.PrivilegedIntentsRequired as exc:
+            raise RuntimeError(
+                "Activa Server Members Intent en Discord Developer Portal para que "
+                "el bot pueda asignar el rol automático al entrar un miembro."
             ) from exc
     finally:
         if not bot.is_closed():

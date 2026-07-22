@@ -18,6 +18,10 @@ services:
         value: "1529539964864430183"
       - key: DISCORD_ADMIN_ROLE_ID
         value: "1529539102805069925"
+      - key: DISCORD_TICKET_SUPPORT_ROLE_ID
+        value: "1529539102805069925"
+      - key: DISCORD_AUTO_ROLE_ID
+        value: "1529563371098083510"
       - key: BRIDGE_SERVER_ID
         value: mystrix-minecraft-1
       - key: DISCORD_TOKEN

@@ -9,10 +9,14 @@ Servicio único para Render: levanta el bot de Discord y una cola HTTP. El mod d
 - `DISCORD_GUILD_ID`: ID del servidor de Discord.
 - `DISCORD_PANEL_CHANNEL_ID`: canal donde se publicará el panel.
 - `DISCORD_ADMIN_ROLE_ID`: rol que puede ejecutar comandos administrativos.
+- `DISCORD_TICKET_SUPPORT_ROLE_ID`: rol que puede ver y responder tickets. En tu servidor: `1529539102805069925`.
+- `DISCORD_AUTO_ROLE_ID`: rol que se asigna automáticamente al entrar. En tu servidor: `1529563371098083510`.
 - `BRIDGE_SECRET`: secreto largo y aleatorio compartido con el mod. Debe tener 32 caracteres o más.
 - `BRIDGE_SERVER_ID`: mismo ID lógico que usará el mod, por defecto `mystrix-minecraft-1`.
 
 Render configura `PORT` automáticamente. No configures `MINECRAFT_API_URL`; esta versión usa polling desde Minecraft hacia Render.
+
+`DISCORD_TICKET_CATEGORY_ID` es opcional. Si no se configura, los tickets se crean en la misma categoría donde esté el panel.
 
 ## Deploy en Render
 
@@ -24,6 +28,35 @@ Render configura `PORT` automáticamente. No configures `MINECRAFT_API_URL`; est
 6. Añade `DISCORD_TOKEN` y `BRIDGE_SECRET` como secretos.
 
 Si ves `Discord rechazó DISCORD_TOKEN`, el build está bien pero el token configurado en Render no es el token real del bot o fue regenerado/revocado.
+
+## Tickets
+
+Ejecuta `/ticket-panel` para publicar o actualizar el panel de soporte. Todos los miembros pueden presionar **Abrir ticket**.
+
+Cada ticket crea un canal privado donde solo tienen acceso:
+
+- el usuario que abrió el ticket
+- el rol `DISCORD_TICKET_SUPPORT_ROLE_ID`
+- el bot
+
+El bot evita que un usuario abra varios tickets a la vez. Dentro del ticket hay un botón **Cerrar ticket** que puede usar el usuario o soporte.
+
+## Autorol
+
+El bot asigna `DISCORD_AUTO_ROLE_ID` a cada miembro nuevo. Para que funcione:
+
+- Activa **Server Members Intent** en Discord Developer Portal.
+- Invita el bot con permisos `Manage Roles`.
+- Coloca el rol del bot por encima del rol que quieres asignar.
+
+## Permisos mínimos del bot
+
+- View Channels
+- Send Messages
+- Embed Links
+- Read Message History
+- Manage Channels
+- Manage Roles
 
 ## Config del mod
 
