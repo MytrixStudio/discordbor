@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: mystrix-whitelist-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.5
+      - key: DISCORD_APPLICATION_ID
+        value: "1529181956841934878"
+      - key: DISCORD_GUILD_ID
+        value: "1529539033586208789"
+      - key: DISCORD_PANEL_CHANNEL_ID
+        value: "1529539964864430183"
+      - key: DISCORD_ADMIN_ROLE_ID
+        value: "1529539102805069925"
+      - key: BRIDGE_SERVER_ID
+        value: mystrix-minecraft-1
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: BRIDGE_SECRET
+        sync: false
